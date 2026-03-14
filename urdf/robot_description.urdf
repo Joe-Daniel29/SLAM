@@ -1,0 +1,131 @@
+<?xml version="1.0"?>
+<!--
+  robot_description.urdf — Minimal URDF for differential drive SLAM bot
+  Defines the TF tree: odom → base_link → laser, base_link → imu_link
+
+  IMPORTANT: Adjust the xyz offsets in the laser and imu joints to match
+  your physical robot. Measurements are in meters from chassis center.
+-->
+<robot name="slam_bot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- ═══════════════ BASE LINK ═══════════════ -->
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <box size="0.22 0.20 0.08"/>  <!-- L x W x H of chassis -->
+      </geometry>
+      <material name="chassis_grey">
+        <color rgba="0.3 0.3 0.3 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="0.22 0.20 0.08"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="1.5"/>
+      <inertia ixx="0.005" ixy="0" ixz="0" iyy="0.008" iyz="0" izz="0.01"/>
+    </inertial>
+  </link>
+
+  <!-- ═══════════════ BASE FOOTPRINT (ground projection) ═══════════════ -->
+  <link name="base_footprint"/>
+  <joint name="base_footprint_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 0.09" rpy="0 0 0"/>  <!-- wheel_radius = 0.09m -->
+  </joint>
+
+  <!-- ═══════════════ LEFT WHEEL ═══════════════ -->
+  <link name="left_wheel">
+    <visual>
+      <geometry>
+        <cylinder radius="0.09" length="0.03"/>
+      </geometry>
+      <material name="wheel_black">
+        <color rgba="0.1 0.1 0.1 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <cylinder radius="0.09" length="0.03"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.2"/>
+      <inertia ixx="0.0004" ixy="0" ixz="0" iyy="0.0004" iyz="0" izz="0.0008"/>
+    </inertial>
+  </link>
+  <joint name="left_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="left_wheel"/>
+    <origin xyz="0 0.10 0" rpy="-1.5708 0 0"/>  <!-- wheel_sep/2 = 0.10 -->
+    <axis xyz="0 0 1"/>
+  </joint>
+
+  <!-- ═══════════════ RIGHT WHEEL ═══════════════ -->
+  <link name="right_wheel">
+    <visual>
+      <geometry>
+        <cylinder radius="0.09" length="0.03"/>
+      </geometry>
+      <material name="wheel_black">
+        <color rgba="0.1 0.1 0.1 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <cylinder radius="0.09" length="0.03"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.2"/>
+      <inertia ixx="0.0004" ixy="0" ixz="0" iyy="0.0004" iyz="0" izz="0.0008"/>
+    </inertial>
+  </link>
+  <joint name="right_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="right_wheel"/>
+    <origin xyz="0 -0.10 0" rpy="-1.5708 0 0"/>
+    <axis xyz="0 0 1"/>
+  </joint>
+
+  <!-- ═══════════════ LIDAR FRAME ═══════════════ -->
+  <!-- Must match frame_id="laser" in custom_lidar_node.cpp -->
+  <link name="laser">
+    <visual>
+      <geometry>
+        <cylinder radius="0.035" length="0.04"/>
+      </geometry>
+      <material name="lidar_blue">
+        <color rgba="0.1 0.3 0.8 1.0"/>
+      </material>
+    </visual>
+    <inertial>
+      <mass value="0.15"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+  </link>
+  <joint name="laser_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="laser"/>
+    <!-- Adjust x,y,z to your actual LiDAR position relative to chassis center -->
+    <origin xyz="0.05 0 0.06" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ═══════════════ IMU FRAME ═══════════════ -->
+  <link name="imu_link">
+    <inertial>
+      <mass value="0.01"/>
+      <inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/>
+    </inertial>
+  </link>
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+    <!-- Adjust to your MPU6050 position, typically near chassis center -->
+    <origin xyz="0 0 0.02" rpy="0 0 0"/>
+  </joint>
+
+</robot>
