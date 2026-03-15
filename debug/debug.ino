@@ -1,7 +1,27 @@
+/*
+ * motors.ino — Differential Drive Motor Controller + MPU6050 IMU
+ *
+ * Receives 6-byte motor command packets from Raspberry Pi via UART:
+ *   [0xAA] [0x55] [left_i8] [right_i8] [checksum] [0x0D]
+ *
+ * Sends 16-byte IMU data packets upstream at ~50 Hz:
+ *   [0xBB] [0x66] [ax_h] [ax_l] [ay_h] [ay_l] [az_h] [az_l]
+ *   [gx_h] [gx_l] [gy_h] [gy_l] [gz_h] [gz_l] [checksum] [0x0D]
+ *
+ * [FUTURE] Encoder packet (0xCC 0x77) — reserved, see bottom of file.
+ *
+ * Hardware:
+ *   - BTS7960 dual H-bridge (4 PWM pins)
+ *   - MPU6050 via I2C (SDA=A4, SCL=A5 on Uno/Nano)
+ *   - UART (pins 0/1) connected to Raspberry Pi
+ *
+ * IMPORTANT: Disconnect Pi TX from Arduino pin 0 before uploading sketches.
+ */
+
 #include <Wire.h>
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Pin Definitions
+// Pin Definitions — swap FORWARD/BACKWARD to reverse a motor's direction
 // ═══════════════════════════════════════════════════════════════════════════════
 #define LEFT_FORWARD_PIN   9
 #define LEFT_BACKWARD_PIN  10
@@ -16,16 +36,22 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // Timing
 // ═══════════════════════════════════════════════════════════════════════════════
-#define IMU_SEND_INTERVAL   100   // ms (10 Hz for readability in serial monitor)
-#define MOTOR_STATE_INTERVAL 2000 // 2 seconds between maneuvers
-
-unsigned long lastImuSendTime = 0;
-unsigned long lastStateChange = 0;
-int currentState = -1; 
-int testSpeed = 50; // PWM speed (0 to 255) for testing
+#define MOTOR_WATCHDOG_MS   500   // Stop motors if no command for this long
+#define IMU_SEND_INTERVAL   20    // ms (~50 Hz)
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Motor Control
+// State
+// ═══════════════════════════════════════════════════════════════════════════════
+unsigned long lastMotorCmdTime = 0;
+unsigned long lastImuSendTime  = 0;
+bool motorsActive = false;
+
+// Serial receive buffer
+uint8_t rxBuf[6];
+uint8_t rxIdx = 0;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Motor Control — safe BTS7960 drive (never PWM both directions at once)
 // ═══════════════════════════════════════════════════════════════════════════════
 void setMotor(int fwdPin, int bwdPin, int speed) {
   speed = constrain(speed, -255, 255);
@@ -41,71 +67,118 @@ void setMotor(int fwdPin, int bwdPin, int speed) {
   }
 }
 
+void stopMotors() {
+  setMotor(LEFT_FORWARD_PIN,  LEFT_BACKWARD_PIN,  0);
+  setMotor(RIGHT_FORWARD_PIN, RIGHT_BACKWARD_PIN, 0);
+  motorsActive = false;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // MPU6050 Setup
 // ═══════════════════════════════════════════════════════════════════════════════
 void setupMPU6050() {
   Wire.begin();
-  Wire.setClock(400000); 
+  Wire.setClock(400000); // 400 kHz fast I2C
 
-  // Wake up MPU6050
+  // Wake up MPU6050 (exit sleep mode)
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(0x6B); // PWR_MGMT_1
-  Wire.write(0x00);
+  Wire.write(0x00); // Clear sleep bit
   Wire.endTransmission(true);
 
-  // Accel config (±2g)
+  // Configure accelerometer: ±2g (default, sensitivity = 16384 LSB/g)
   Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x1C); 
-  Wire.write(0x00); 
+  Wire.write(0x1C); // ACCEL_CONFIG
+  Wire.write(0x00); // ±2g
   Wire.endTransmission(true);
 
-  // Gyro config (±250°/s)
+  // Configure gyroscope: ±250°/s (default, sensitivity = 131 LSB/°/s)
   Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x1B); 
-  Wire.write(0x00); 
+  Wire.write(0x1B); // GYRO_CONFIG
+  Wire.write(0x00); // ±250°/s
   Wire.endTransmission(true);
 
-  // DLPF to ~44 Hz
+  // Set DLPF (Digital Low Pass Filter) to ~44 Hz bandwidth
   Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x1A); 
-  Wire.write(0x03); 
+  Wire.write(0x1A); // CONFIG
+  Wire.write(0x03); // DLPF_CFG = 3 (44 Hz accel, 42 Hz gyro)
   Wire.endTransmission(true);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// IMU Read and Print
+// Read 14 bytes of raw sensor data from MPU6050 and send as packet
 // ═══════════════════════════════════════════════════════════════════════════════
-void readAndPrintIMU() {
+void readAndSendIMU() {
   Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x3B); 
+  Wire.write(0x3B); // Start at ACCEL_XOUT_H
   Wire.endTransmission(false);
   Wire.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)14, (uint8_t)true);
 
-  if (Wire.available() < 14) return;
+  if (Wire.available() < 14) return; // Incomplete read, skip
 
-  // Read high and low bytes and combine them into 16-bit integers
-  int16_t ax = Wire.read() << 8 | Wire.read();
-  int16_t ay = Wire.read() << 8 | Wire.read();
-  int16_t az = Wire.read() << 8 | Wire.read();
+  uint8_t packet[16];
+  packet[0] = 0xBB; // Header
+  packet[1] = 0x66; // Header
 
-  Wire.read(); // Skip temp high
-  Wire.read(); // Skip temp low
+  // Accel X, Y, Z (6 bytes) — registers 0x3B–0x40
+  packet[2] = Wire.read();  // ax_h
+  packet[3] = Wire.read();  // ax_l
+  packet[4] = Wire.read();  // ay_h
+  packet[5] = Wire.read();  // ay_l
+  packet[6] = Wire.read();  // az_h
+  packet[7] = Wire.read();  // az_l
 
-  int16_t gx = Wire.read() << 8 | Wire.read();
-  int16_t gy = Wire.read() << 8 | Wire.read();
-  int16_t gz = Wire.read() << 8 | Wire.read();
+  // Skip temperature (2 bytes) — registers 0x41–0x42
+  Wire.read();
+  Wire.read();
 
-  // Print readable values to Serial Monitor
-  Serial.print("Accel (X,Y,Z): ");
-  Serial.print(ax); Serial.print(", ");
-  Serial.print(ay); Serial.print(", ");
-  Serial.print(az);
-  
-  Serial.print("  |  Gyro (X,Y,Z): ");
-  Serial.print(gx); Serial.print(", ");
-  Serial.print(gy); Serial.print(", ");
-  Serial.println(gz);
+  // Gyro X, Y, Z (6 bytes) — registers 0x43–0x48
+  packet[8]  = Wire.read(); // gx_h
+  packet[9]  = Wire.read(); // gx_l
+  packet[10] = Wire.read(); // gy_h
+  packet[11] = Wire.read(); // gy_l
+  packet[12] = Wire.read(); // gz_h
+  packet[13] = Wire.read(); // gz_l
+
+  // Checksum: sum of bytes 0–13
+  uint8_t cksum = 0;
+  for (int i = 0; i < 14; i++) {
+    cksum += packet[i];
+  }
+  packet[14] = cksum;
+  packet[15] = 0x0D; // Tail
+
+  Serial.write(packet, 16);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Parse incoming motor command packet
+// ═══════════════════════════════════════════════════════════════════════════════
+void processMotorPacket(uint8_t* pkt) {
+  // Validate header and tail
+  if (pkt[0] != 0xAA || pkt[1] != 0x55 || pkt[5] != 0x0D) return;
+
+  // Validate checksum
+  uint8_t expected_cksum = (pkt[0] + pkt[1] + pkt[2] + pkt[3]) & 0xFF;
+  if (pkt[4] != expected_cksum) return;
+
+  // Extract signed speeds (-127 to +127)
+  int8_t leftCmd  = (int8_t)pkt[2];
+  int8_t rightCmd = (int8_t)pkt[3];
+
+  // Scale from [-127, +127] to [-255, +255] PWM
+  int leftPWM  = map(leftCmd,  -127, 127, -255, 255);
+  int rightPWM = map(rightCmd, -127, 127, -255, 255);
+
+  // Apply deadband (ignore tiny commands that cause motor whine)
+  if (abs(leftPWM)  < 15) leftPWM  = 0;
+  if (abs(rightPWM) < 15) rightPWM = 0;
+
+  setMotor(LEFT_FORWARD_PIN,  LEFT_BACKWARD_PIN,  leftPWM);
+  setMotor(RIGHT_FORWARD_PIN, RIGHT_BACKWARD_PIN, rightPWM);
+
+  motorsActive = true;
+  lastMotorCmdTime = millis();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -113,65 +186,59 @@ void readAndPrintIMU() {
 // ═══════════════════════════════════════════════════════════════════════════════
 void setup() {
   Serial.begin(115200);
-  Serial.println("Starting Motor and IMU Debug...");
 
   // Motor pins
   pinMode(LEFT_FORWARD_PIN,   OUTPUT);
   pinMode(LEFT_BACKWARD_PIN,  OUTPUT);
   pinMode(RIGHT_FORWARD_PIN,  OUTPUT);
   pinMode(RIGHT_BACKWARD_PIN, OUTPUT);
-  
-  setMotor(LEFT_FORWARD_PIN, LEFT_BACKWARD_PIN, 0);
-  setMotor(RIGHT_FORWARD_PIN, RIGHT_BACKWARD_PIN, 0);
+  stopMotors();
 
+  // MPU6050
   setupMPU6050();
 
-  lastImuSendTime = millis();
-  // Force a state change immediately
-  lastStateChange = millis() - MOTOR_STATE_INTERVAL;
+  lastMotorCmdTime = millis();
+  lastImuSendTime  = millis();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Loop
+// Main Loop
 // ═══════════════════════════════════════════════════════════════════════════════
 void loop() {
   unsigned long now = millis();
 
-  // 1. Process IMU reading independently
+  // ── 1. Read serial for motor commands ──────────────────────────────────────
+  while (Serial.available() > 0) {
+    uint8_t b = Serial.read();
+
+    // Synchronize: if we see header byte 0xAA at position 0, start buffering
+    if (rxIdx == 0 && b != 0xAA) continue; // Wait for header
+    if (rxIdx == 1 && b != 0x55) { rxIdx = 0; continue; } // Bad second header
+
+    rxBuf[rxIdx++] = b;
+
+    if (rxIdx >= 6) {
+      processMotorPacket(rxBuf);
+      rxIdx = 0;
+    }
+  }
+
+  // ── 2. Motor watchdog ──────────────────────────────────────────────────────
+  if (motorsActive && (now - lastMotorCmdTime > MOTOR_WATCHDOG_MS)) {
+    stopMotors();
+  }
+
+  // ── 3. Send IMU data at ~50 Hz ────────────────────────────────────────────
   if (now - lastImuSendTime >= IMU_SEND_INTERVAL) {
-    readAndPrintIMU();
+    readAndSendIMU();
     lastImuSendTime = now;
   }
 
-  // 2. State machine for motors checking every 2000ms
-  if (now - lastStateChange >= MOTOR_STATE_INTERVAL) {
-    currentState = (currentState + 1) % 4; // Cycle 0 -> 1 -> 2 -> 3
-    lastStateChange = now;
-    
-    switch(currentState) {
-      case 0: // Forward
-        Serial.println("\n--- MOTOR STATE: FORWARD ---");
-        setMotor(LEFT_FORWARD_PIN, LEFT_BACKWARD_PIN, testSpeed);
-        setMotor(RIGHT_FORWARD_PIN, RIGHT_BACKWARD_PIN, testSpeed);
-        break;
-        
-      case 1: // Backward
-        Serial.println("\n--- MOTOR STATE: BACKWARD ---");
-        setMotor(LEFT_FORWARD_PIN, LEFT_BACKWARD_PIN, -testSpeed);
-        setMotor(RIGHT_FORWARD_PIN, RIGHT_BACKWARD_PIN, -testSpeed);
-        break;
-        
-      case 2: // Left turn
-        Serial.println("\n--- MOTOR STATE: LEFT TURN ---");
-        setMotor(LEFT_FORWARD_PIN, LEFT_BACKWARD_PIN, -testSpeed);
-        setMotor(RIGHT_FORWARD_PIN, RIGHT_BACKWARD_PIN, testSpeed);
-        break;
-        
-      case 3: // Right turn
-        Serial.println("\n--- MOTOR STATE: RIGHT TURN ---");
-        setMotor(LEFT_FORWARD_PIN, LEFT_BACKWARD_PIN, testSpeed);
-        setMotor(RIGHT_FORWARD_PIN, RIGHT_BACKWARD_PIN, -testSpeed);
-        break;
-    }
-  }
-}
+  // ── 4. [FUTURE] Read encoders and send encoder packet ─────────────────────
+  // When you add quadrature encoders:
+  //   - Attach interrupt pins for encoder A/B channels
+  //   - Count ticks in ISR
+  //   - At ~50 Hz, send packet: [0xCC] [0x77] [leftTicks_4bytes] [rightTicks_4bytes] [cksum] [0x0D]
+  //   - Reset tick counters after sending
+  // The diff_drive_controller on the Pi already has a stub to parse 0xCC 0x77 packets.
+}f
