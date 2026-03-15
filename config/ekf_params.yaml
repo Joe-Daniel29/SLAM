@@ -1,0 +1,77 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ekf_params.yaml — robot_localization Extended Kalman Filter
+#
+# Fuses three odometry sources:
+#   1. rf2o_laser_odometry → laser scan-matching (translation + some rotation)
+#   2. IMU (/imu/data_raw) → angular velocity (yaw rate) + orientation
+#   3. cmd_vel dead-reckoning (/odom/cmd_vel) → low-trust fallback
+#
+# Output: /odom (fused, clean) + odom→base_link TF
+# ═══════════════════════════════════════════════════════════════════════════════
+ekf_filter_node:
+  ros__parameters:
+    frequency: 30.0
+    two_d_mode: true            # We're a 2D ground robot
+    publish_tf: true
+    publish_acceleration: false
+
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom           # EKF works in odom frame; slam_toolbox provides map→odom
+
+    # ── Source 0: rf2o laser odometry ─────────────────────────────────────────
+    # Provides: X, Y position and Yaw from laser scan-matching
+    odom0: /odom/rf2o
+    odom0_frame: odom
+    odom0_differential: true    # Use differential (delta) mode — more robust
+    # Matrix rows: x, y, z, roll, pitch, yaw, vx, vy, vz, v_roll, v_pitch, v_yaw, ax, ay, az
+    odom0_config: [true,  true,  false,   # x, y, z
+                   false, false, false,   # roll, pitch, yaw
+                   false, false, false,   # vx, vy, vz
+                   false, false, false,   # v_roll, v_pitch, v_yaw
+                   false, false, false]   # ax, ay, az
+
+    # ── Source 1: IMU ─────────────────────────────────────────────────────────
+    # Provides: angular velocity (yaw rate) — this is what the IMU is best at
+    # We do NOT use linear acceleration (double-integration drift is catastrophic)
+    imu0: /imu/data_raw
+    imu0_differential: false
+    imu0_remove_gravitational_acceleration: true
+    imu0_config: [false, false, false,   # x, y, z
+                  false, false, false,   # roll, pitch, yaw
+                  false, false, false,   # vx, vy, vz
+                  false, false, true,    # v_roll, v_pitch, v_yaw  ← yaw rate only
+                  false, false, false]   # ax, ay, az
+
+    # ── Source 2: cmd_vel dead-reckoning (low trust fallback) ─────────────────
+    # Provides: vx, v_yaw from motor commands — keeps EKF alive if rf2o hiccups
+    odom1: /odom/cmd_vel
+    odom1_frame: odom
+    odom1_differential: true
+    odom1_config: [false, false, false,   # x, y, z
+                   false, false, false,   # roll, pitch, yaw
+                   true,  false, false,   # vx, vy, vz         ← forward velocity
+                   false, false, true,    # v_roll, v_pitch, v_yaw ← yaw rate
+                   false, false, false]   # ax, ay, az
+
+    # ── Process noise covariance (tune on real hardware) ──────────────────────
+    # Lower values = smoother but slower to react
+    # Higher values = noisier but faster to react
+    process_noise_covariance: [
+      0.05,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+      0.0,   0.05,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+      0.0,   0.0,   0.06,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+      0.0,   0.0,   0.0,   0.03,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+      0.0,   0.0,   0.0,   0.0,   0.03,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+      0.0,   0.0,   0.0,   0.0,   0.0,   0.06,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+      0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.025, 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+      0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.025, 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+      0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.04,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+      0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.01,  0.0,   0.0,   0.0,   0.0,   0.0,
+      0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.01,  0.0,   0.0,   0.0,   0.0,
+      0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.02,  0.0,   0.0,   0.0,
+      0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.01,  0.0,   0.0,
+      0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.01,  0.0,
+      0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.015
+    ]

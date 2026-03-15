@@ -2,10 +2,12 @@
 slam_bot.launch.py — Launch the full SLAM differential drive robot stack
 
 Launches:
-  1. robot_state_publisher (URDF → TF tree)
-  2. custom_lidar_node     (LiDAR → /scan)
-  3. diff_drive_controller (cmd_vel → motors, Arduino IMU → /imu/data_raw, /odom)
-  4. slam_toolbox           (online async SLAM)
+  1. robot_state_publisher     (URDF → static TF tree)
+  2. custom_lidar_node         (LiDAR → /scan)
+  3. diff_drive_controller     (cmd_vel → motors, IMU → /imu/data_raw, /odom/cmd_vel)
+  4. rf2o_laser_odometry       (scan-matching → /odom/rf2o)
+  5. robot_localization EKF    (fuses rf2o + IMU + cmd_vel → /odom + odom→base_link TF)
+  6. slam_toolbox              (online async SLAM → /map)
 
 Usage:
   ros2 launch slam_bot slam_bot.launch.py
@@ -38,6 +40,7 @@ def generate_launch_description():
 
     # ── Nodes ─────────────────────────────────────────────────────────────────
 
+    # 1. Robot State Publisher — broadcasts URDF static transforms
     robot_state_publisher = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
@@ -49,6 +52,7 @@ def generate_launch_description():
         output='screen',
     )
 
+    # 2. Custom LiDAR Node — publishes /scan
     custom_lidar_node = Node(
         package='slam_bot',
         executable='custom_lidar_node',
@@ -56,6 +60,7 @@ def generate_launch_description():
         output='screen',
     )
 
+    # 3. Diff Drive Controller — cmd_vel → serial, IMU → /imu/data_raw, dead-reckoning → /odom/cmd_vel
     diff_drive_controller = Node(
         package='slam_bot',
         executable='diff_drive_controller',
@@ -71,6 +76,34 @@ def generate_launch_description():
         output='screen',
     )
 
+    # 4. RF2O Laser Odometry — scan-matching → /odom/rf2o
+    rf2o_laser_odometry = Node(
+        package='rf2o_laser_odometry',
+        executable='rf2o_laser_odometry_node',
+        name='rf2o_laser_odometry',
+        parameters=[{
+            'laser_scan_topic': '/scan',
+            'odom_topic': '/odom/rf2o',
+            'publish_tf': False,           # EKF handles TF
+            'base_frame_id': 'base_link',
+            'odom_frame_id': 'odom',
+            'freq': 20.0,                  # Match our odom rate
+        }],
+        output='screen',
+    )
+
+    # 5. Robot Localization EKF — fuses rf2o + IMU + cmd_vel → /odom + odom→base_link TF
+    ekf_filter_node = Node(
+        package='robot_localization',
+        executable='ekf_node',
+        name='ekf_filter_node',
+        parameters=[
+            os.path.join(pkg_share, 'config', 'ekf_params.yaml')
+        ],
+        output='screen',
+    )
+
+    # 6. SLAM Toolbox — online async SLAM → /map
     slam_toolbox = Node(
         package='slam_toolbox',
         executable='async_slam_toolbox_node',
@@ -86,5 +119,7 @@ def generate_launch_description():
         robot_state_publisher,
         custom_lidar_node,
         diff_drive_controller,
+        rf2o_laser_odometry,
+        ekf_filter_node,
         slam_toolbox,
     ])

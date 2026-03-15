@@ -3,7 +3,8 @@
 //
 // Bridges /cmd_vel (Twist) → serial motor packets for BTS7960 differential drive
 // Receives IMU packets from Arduino (MPU6050) → publishes /imu/data_raw
-// Publishes open-loop odometry on /odom with odom→base_link TF
+// Publishes open-loop odometry on /odom/cmd_vel (low-trust input for EKF)
+// NOTE: The robot_localization EKF owns /odom and the odom→base_link TF
 //
 // Serial protocol (Pi → Arduino):
 //   Motor packet [6 bytes]: 0xAA 0x55 <left_i8> <right_i8> <checksum> 0x0D
@@ -20,9 +21,7 @@
 #include <geometry_msgs/msg/twist.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <nav_msgs/msg/odometry.hpp>
-#include <tf2_ros/transform_broadcaster.h>
 #include <tf2/LinearMath/Quaternion.h>
-#include <geometry_msgs/msg/transform_stamped.hpp>
 
 #include <fcntl.h>
 #include <termios.h>
@@ -71,7 +70,8 @@ public:
         RCLCPP_INFO(get_logger(), "Serial open: %s @ %d baud", serial_port_.c_str(), baud_rate_);
 
         // ── Publishers ───────────────────────────────────────────────────────
-        odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/odom", 10);
+        // Publish to /odom/cmd_vel — the EKF fuses this as a low-trust source
+        odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/odom/cmd_vel", 10);
         imu_pub_  = create_publisher<sensor_msgs::msg::Imu>("/imu/data_raw", 10);
 
         // ── Subscriber ───────────────────────────────────────────────────────
@@ -79,8 +79,7 @@ public:
             "/cmd_vel", 10,
             std::bind(&DiffDriveController::cmd_vel_callback, this, std::placeholders::_1));
 
-        // ── TF broadcaster ───────────────────────────────────────────────────
-        tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        // NOTE: odom→base_link TF is published by the robot_localization EKF node
 
         // ── Timers ───────────────────────────────────────────────────────────
         // Motor send + watchdog @ 20 Hz
@@ -138,7 +137,6 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr      odom_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr        imu_pub_;
-    std::unique_ptr<tf2_ros::TransformBroadcaster>             tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr motor_timer_;
     rclcpp::TimerBase::SharedPtr odom_timer_;
 
@@ -264,21 +262,6 @@ private:
         odom_msg.twist.twist.angular.z = v_ang;
 
         odom_pub_->publish(odom_msg);
-
-        // ── Broadcast odom → base_link TF ────────────────────────────────────
-        geometry_msgs::msg::TransformStamped tf;
-        tf.header.stamp    = now;
-        tf.header.frame_id = "odom";
-        tf.child_frame_id  = "base_link";
-        tf.transform.translation.x = odom_x_;
-        tf.transform.translation.y = odom_y_;
-        tf.transform.translation.z = 0.0;
-        tf.transform.rotation.x = q.x();
-        tf.transform.rotation.y = q.y();
-        tf.transform.rotation.z = q.z();
-        tf.transform.rotation.w = q.w();
-
-        tf_broadcaster_->sendTransform(tf);
     }
 
     // ═════════════════════════════════════════════════════════════════════════
