@@ -161,6 +161,10 @@ private:
         msg.range_min = 0.15; // 15cm minimum
         msg.range_max = 8.0;  // 8m maximum
 
+        // Required by rf2o and other scan-matching nodes
+        msg.scan_time = 1.0 / 7.5;                          // ~0.133s per revolution
+        msg.time_increment = msg.scan_time / 360.0;          // time between individual rays
+
         // Convert to meters and handle missing data
         for (int i = 0; i < 360; i++) {
             if (scan_360[i] > 0.0f) {

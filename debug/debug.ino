@@ -171,8 +171,8 @@ void processMotorPacket(uint8_t* pkt) {
   int rightPWM = map(rightCmd, -127, 127, -255, 255);
 
   // Apply deadband (ignore tiny commands that cause motor whine)
-  if (abs(leftPWM)  < 15) leftPWM  = 0;
-  if (abs(rightPWM) < 15) rightPWM = 0;
+  if (abs(leftPWM)  < 5) leftPWM  = 0;
+  if (abs(rightPWM) < 5) rightPWM = 0;
 
   setMotor(LEFT_FORWARD_PIN,  LEFT_BACKWARD_PIN,  leftPWM);
   setMotor(RIGHT_FORWARD_PIN, RIGHT_BACKWARD_PIN, rightPWM);
@@ -241,4 +241,4 @@ void loop() {
   //   - At ~50 Hz, send packet: [0xCC] [0x77] [leftTicks_4bytes] [rightTicks_4bytes] [cksum] [0x0D]
   //   - Reset tick counters after sending
   // The diff_drive_controller on the Pi already has a stub to parse 0xCC 0x77 packets.
-}f
+}
