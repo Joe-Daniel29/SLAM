@@ -8,14 +8,11 @@
 //
 // Serial protocol (Pi → Arduino):
 //   Motor packet [6 bytes]: 0xAA 0x55 <left_i8> <right_i8> <checksum> 0x0D
+//   NOTE: Motors are negated and swapped so "forward" = camera direction
 //
 // Serial protocol (Arduino → Pi):
 //   IMU packet [16 bytes]: 0xBB 0x66 <ax_h> <ax_l> <ay_h> <ay_l> <az_h> <az_l>
 //                          <gx_h> <gx_l> <gy_h> <gy_l> <gz_h> <gz_l> <cksum> 0x0D
-//
-//   [FUTURE] Encoder packet [10 bytes]: 0xCC 0x77 <left_ticks_i32> <right_ticks_i32> <cksum> 0x0D
-//
-// Author: Principal Robotics Engineer Pipeline — auto-generated
 // ═══════════════════════════════════════════════════════════════════════════════
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/twist.hpp>
@@ -33,34 +30,27 @@
 #include <mutex>
 #include <vector>
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MPU6050 scale factors (default ±2g accel, ±250°/s gyro)
-// ─────────────────────────────────────────────────────────────────────────────
-static constexpr double ACCEL_SCALE = 9.80665 / 16384.0;   // raw → m/s²
-static constexpr double GYRO_SCALE  = (M_PI / 180.0) / 131.0; // raw → rad/s
+static constexpr double ACCEL_SCALE = 9.80665 / 16384.0;
+static constexpr double GYRO_SCALE  = (M_PI / 180.0) / 131.0;
 
 class DiffDriveController : public rclcpp::Node {
 public:
     DiffDriveController() : Node("diff_drive_controller") {
-        // ── Declare parameters ───────────────────────────────────────────────
-        this->declare_parameter("serial_port",      "/dev/ttyACM0");
-        this->declare_parameter("baud_rate",         115200);
-        this->declare_parameter("wheel_radius",      0.09);
-        this->declare_parameter("wheel_separation",  0.2);
-        this->declare_parameter("max_rpm",           600.0);
+        this->declare_parameter("serial_port",       "/dev/ttyACM0");
+        this->declare_parameter("baud_rate",          115200);
+        this->declare_parameter("wheel_radius",       0.09);
+        this->declare_parameter("wheel_separation",   0.2);
+        this->declare_parameter("max_rpm",            600.0);
         this->declare_parameter("cmd_vel_timeout_ms", 500);
 
-        serial_port_     = this->get_parameter("serial_port").as_string();
-        baud_rate_       = this->get_parameter("baud_rate").as_int();
-        wheel_radius_    = this->get_parameter("wheel_radius").as_double();
-        wheel_sep_       = this->get_parameter("wheel_separation").as_double();
-        max_rpm_         = this->get_parameter("max_rpm").as_double();
-        cmd_timeout_ms_  = this->get_parameter("cmd_vel_timeout_ms").as_int();
+        serial_port_    = this->get_parameter("serial_port").as_string();
+        baud_rate_      = this->get_parameter("baud_rate").as_int();
+        wheel_radius_   = this->get_parameter("wheel_radius").as_double();
+        wheel_sep_      = this->get_parameter("wheel_separation").as_double();
+        max_rpm_        = this->get_parameter("max_rpm").as_double();
+        cmd_timeout_ms_ = this->get_parameter("cmd_vel_timeout_ms").as_int();
+        max_wheel_vel_  = (max_rpm_ * 2.0 * M_PI) / 60.0;
 
-        // Derived
-        max_wheel_vel_ = (max_rpm_ * 2.0 * M_PI) / 60.0; // rad/s
-
-        // ── Open serial port ─────────────────────────────────────────────────
         serial_fd_ = open_serial(serial_port_, baud_rate_);
         if (serial_fd_ < 0) {
             RCLCPP_FATAL(get_logger(), "Cannot open serial port %s", serial_port_.c_str());
@@ -69,35 +59,27 @@ public:
         }
         RCLCPP_INFO(get_logger(), "Serial open: %s @ %d baud", serial_port_.c_str(), baud_rate_);
 
-        // ── Publishers ───────────────────────────────────────────────────────
-        // Publish to /odom/cmd_vel — the EKF fuses this as a low-trust source
         odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/odom/cmd_vel", 10);
         imu_pub_  = create_publisher<sensor_msgs::msg::Imu>("/imu/data_raw", 10);
 
-        // ── Subscriber ───────────────────────────────────────────────────────
         cmd_vel_sub_ = create_subscription<geometry_msgs::msg::Twist>(
             "/cmd_vel", 10,
             std::bind(&DiffDriveController::cmd_vel_callback, this, std::placeholders::_1));
 
-        // NOTE: odom→base_link TF is published by the robot_localization EKF node
-
-        // ── Timers ───────────────────────────────────────────────────────────
-        // Motor send + watchdog @ 20 Hz
+        // Motor loop at 50 Hz (fast enough to be smooth, matches Arduino IMU rate)
         motor_timer_ = create_wall_timer(
-            std::chrono::milliseconds(50),
+            std::chrono::milliseconds(20),
             std::bind(&DiffDriveController::motor_timer_callback, this));
 
-        // Odometry @ 20 Hz
         odom_timer_ = create_wall_timer(
             std::chrono::milliseconds(50),
             std::bind(&DiffDriveController::odom_timer_callback, this));
 
-        // ── Serial reader thread (for IMU + future encoder packets) ──────────
         running_.store(true);
         serial_reader_thread_ = std::thread(&DiffDriveController::serial_reader_loop, this);
 
         RCLCPP_INFO(get_logger(),
-            "DiffDriveController ready — wheel_r=%.3fm, wheel_sep=%.3fm, max_rpm=%.0f",
+            "DiffDriveController ready — r=%.3fm sep=%.3fm rpm=%.0f | 50Hz motor + EMA smoothing",
             wheel_radius_, wheel_sep_, max_rpm_);
     }
 
@@ -105,63 +87,55 @@ public:
         running_.store(false);
         if (serial_reader_thread_.joinable()) serial_reader_thread_.join();
         if (serial_fd_ >= 0) {
-            // Send stop before closing
             send_motor_packet(0, 0);
             close(serial_fd_);
         }
     }
 
 private:
-    // ═════════════════════════════════════════════════════════════════════════
-    // Parameters
-    // ═════════════════════════════════════════════════════════════════════════
     std::string serial_port_;
-    int         baud_rate_;
-    double      wheel_radius_;
-    double      wheel_sep_;
-    double      max_rpm_;
-    int         cmd_timeout_ms_;
-    double      max_wheel_vel_; // rad/s
+    int    baud_rate_, cmd_timeout_ms_;
+    double wheel_radius_, wheel_sep_, max_rpm_, max_wheel_vel_;
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // Serial
-    // ═════════════════════════════════════════════════════════════════════════
     int serial_fd_ = -1;
     std::atomic<bool> running_{false};
     std::thread serial_reader_thread_;
     std::mutex serial_write_mutex_;
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // ROS interfaces
-    // ═════════════════════════════════════════════════════════════════════════
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr      odom_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr        imu_pub_;
     rclcpp::TimerBase::SharedPtr motor_timer_;
     rclcpp::TimerBase::SharedPtr odom_timer_;
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // Motion state (protected by mutex)
-    // ═════════════════════════════════════════════════════════════════════════
     std::mutex cmd_mutex_;
     double target_linear_  = 0.0;
     double target_angular_ = 0.0;
     rclcpp::Time last_cmd_time_{0, 0, RCL_ROS_TIME};
-    bool   cmd_received_ = false;
+    bool cmd_received_ = false;
 
-    // Open-loop odometry state
-    double odom_x_     = 0.0;
-    double odom_y_     = 0.0;
-    double odom_theta_ = 0.0;
+    // ── Velocity smoothing state ─────────────────────────────────────────────
+    double smooth_lin_ = 0.0;
+    double smooth_ang_ = 0.0;
+
+    // Smoothing: simple EMA only (no rate limiter — it was strangling the signal)
+    // At 50Hz with alpha=0.3: reaches 95% of target in ~0.2s (smooth but responsive)
+    static constexpr double EMA_LIN = 0.3;
+    static constexpr double EMA_ANG = 0.3;
+
+    // Odometry state
+    double odom_x_ = 0.0, odom_y_ = 0.0, odom_theta_ = 0.0;
     rclcpp::Time last_odom_time_{0, 0, RCL_ROS_TIME};
     bool odom_initialized_ = false;
+    double current_left_vel_ = 0.0, current_right_vel_ = 0.0;
 
-    // Current wheel velocities (for odometry)
-    double current_left_vel_  = 0.0;  // m/s
-    double current_right_vel_ = 0.0;  // m/s
+    // Gyro bias calibration
+    static constexpr int CALIB_SAMPLES = 150; // ~3s at 50Hz
+    int calib_count_ = 0;
+    std::atomic<bool> calib_done_{false};
+    double gyro_bias_x_ = 0.0, gyro_bias_y_ = 0.0, gyro_bias_z_ = 0.0;
+    double gyro_sum_x_  = 0.0, gyro_sum_y_  = 0.0, gyro_sum_z_  = 0.0;
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // /cmd_vel callback
     // ═════════════════════════════════════════════════════════════════════════
     void cmd_vel_callback(const geometry_msgs::msg::Twist::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(cmd_mutex_);
@@ -172,39 +146,36 @@ private:
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // Motor timer — inverse kinematics + serial TX (20 Hz)
+    // Motor timer — 50 Hz with rate limiting + EMA smoothing
     // ═════════════════════════════════════════════════════════════════════════
     void motor_timer_callback() {
         double v_lin, v_ang;
         {
             std::lock_guard<std::mutex> lock(cmd_mutex_);
-
-            // ── Watchdog: stop if no cmd_vel for timeout period ──────────────
             if (cmd_received_) {
                 auto elapsed = (this->now() - last_cmd_time_).nanoseconds() / 1e6;
                 if (elapsed > cmd_timeout_ms_) {
                     target_linear_  = 0.0;
                     target_angular_ = 0.0;
-                    if (elapsed < cmd_timeout_ms_ + 100) { // log once
+                    if (elapsed < cmd_timeout_ms_ + 100)
                         RCLCPP_WARN(get_logger(), "cmd_vel timeout — motors stopped");
-                    }
                 }
             }
             v_lin = target_linear_;
             v_ang = target_angular_;
         }
 
-        // ── Differential-drive inverse kinematics ────────────────────────────
-        //   v_left  = v_linear - (angular × wheel_sep / 2)
-        //   v_right = v_linear + (angular × wheel_sep / 2)
-        double v_left  = v_lin - (v_ang * wheel_sep_ / 2.0);
-        double v_right = v_lin + (v_ang * wheel_sep_ / 2.0);
+        // ── EMA smoothing (simple, one-stage) ─────────────────────────────────
+        smooth_lin_ += EMA_LIN * (v_lin - smooth_lin_);
+        smooth_ang_ += EMA_ANG * (v_ang - smooth_ang_);
 
-        // Store for open-loop odometry (m/s)
+        // ── Inverse kinematics ───────────────────────────────────────────────
+        double v_left  = smooth_lin_ - (smooth_ang_ * wheel_sep_ / 2.0);
+        double v_right = smooth_lin_ + (smooth_ang_ * wheel_sep_ / 2.0);
+
         current_left_vel_  = v_left;
         current_right_vel_ = v_right;
 
-        // Convert m/s → wheel rad/s → fraction of max → PWM [-127, +127]
         double left_rad_s  = v_left  / wheel_radius_;
         double right_rad_s = v_right / wheel_radius_;
 
@@ -215,224 +186,167 @@ private:
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // Odometry timer (open-loop dead reckoning, 20 Hz)
-    // ═════════════════════════════════════════════════════════════════════════
     void odom_timer_callback() {
         rclcpp::Time now = this->now();
-
         if (!odom_initialized_) {
-            last_odom_time_   = now;
+            last_odom_time_ = now;
             odom_initialized_ = true;
             return;
         }
-
         double dt = (now - last_odom_time_).seconds();
         last_odom_time_ = now;
-        if (dt <= 0.0 || dt > 1.0) return; // guard
+        if (dt <= 0.0 || dt > 1.0) return;
 
-        // ── Forward kinematics ───────────────────────────────────────────────
         double v_lin = (current_right_vel_ + current_left_vel_) / 2.0;
         double v_ang = (current_right_vel_ - current_left_vel_) / wheel_sep_;
 
-        double delta_theta = v_ang * dt;
-        double delta_x     = v_lin * cos(odom_theta_ + delta_theta / 2.0) * dt;
-        double delta_y     = v_lin * sin(odom_theta_ + delta_theta / 2.0) * dt;
+        odom_theta_ += v_ang * dt;
+        odom_x_ += v_lin * cos(odom_theta_) * dt;
+        odom_y_ += v_lin * sin(odom_theta_) * dt;
 
-        odom_x_     += delta_x;
-        odom_y_     += delta_y;
-        odom_theta_ += delta_theta;
-
-        // ── Publish odometry message ─────────────────────────────────────────
-        auto odom_msg = nav_msgs::msg::Odometry();
-        odom_msg.header.stamp    = now;
-        odom_msg.header.frame_id = "odom";
-        odom_msg.child_frame_id  = "base_link";
-
-        odom_msg.pose.pose.position.x = odom_x_;
-        odom_msg.pose.pose.position.y = odom_y_;
-
+        auto msg = nav_msgs::msg::Odometry();
+        msg.header.stamp = now;
+        msg.header.frame_id = "odom";
+        msg.child_frame_id  = "base_link";
+        msg.pose.pose.position.x = odom_x_;
+        msg.pose.pose.position.y = odom_y_;
         tf2::Quaternion q;
-        q.setRPY(0.0, 0.0, odom_theta_);
-        odom_msg.pose.pose.orientation.x = q.x();
-        odom_msg.pose.pose.orientation.y = q.y();
-        odom_msg.pose.pose.orientation.z = q.z();
-        odom_msg.pose.pose.orientation.w = q.w();
-
-        odom_msg.twist.twist.linear.x  = v_lin;
-        odom_msg.twist.twist.angular.z = v_ang;
-
-        odom_pub_->publish(odom_msg);
+        q.setRPY(0, 0, odom_theta_);
+        msg.pose.pose.orientation.x = q.x();
+        msg.pose.pose.orientation.y = q.y();
+        msg.pose.pose.orientation.z = q.z();
+        msg.pose.pose.orientation.w = q.w();
+        msg.twist.twist.linear.x  = v_lin;
+        msg.twist.twist.angular.z = v_ang;
+        odom_pub_->publish(msg);
     }
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // Serial reader thread — parses incoming IMU packets (and future encoders)
     // ═════════════════════════════════════════════════════════════════════════
     void serial_reader_loop() {
         std::vector<uint8_t> buf;
         buf.reserve(64);
         uint8_t byte;
-
         while (running_.load()) {
             int n = read(serial_fd_, &byte, 1);
-            if (n <= 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                continue;
-            }
-
+            if (n <= 0) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
             buf.push_back(byte);
+            if (buf.size() > 64) buf.erase(buf.begin(), buf.end() - 32);
 
-            // Keep buffer from growing unbounded
-            if (buf.size() > 64) {
-                buf.erase(buf.begin(), buf.end() - 32);
-            }
-
-            // ── Try to match IMU packet: 0xBB 0x66 ... (16 bytes total) ──────
             if (buf.size() >= 16) {
-                size_t start = buf.size() - 16;
-                if (buf[start] == 0xBB && buf[start + 1] == 0x66 && buf[start + 15] == 0x0D) {
-                    // Validate checksum
-                    uint8_t cksum = 0;
-                    for (int i = 0; i < 14; ++i) {
-                        cksum += buf[start + i];
-                    }
-                    if (cksum == buf[start + 14]) {
-                        parse_and_publish_imu(&buf[start + 2]);
+                size_t s = buf.size() - 16;
+                if (buf[s] == 0xBB && buf[s+1] == 0x66 && buf[s+15] == 0x0D) {
+                    uint8_t ck = 0;
+                    for (int i = 0; i < 14; ++i) ck += buf[s+i];
+                    if (ck == buf[s+14]) {
+                        parse_and_publish_imu(&buf[s+2]);
                         buf.clear();
-                        continue;
                     }
                 }
             }
-
-            // ── [FUTURE] Encoder packet: 0xCC 0x77 ... (10 bytes total) ──────
-            // When you add encoders, uncomment and implement:
-            // if (buf.size() >= 10) {
-            //     size_t start = buf.size() - 10;
-            //     if (buf[start] == 0xCC && buf[start + 1] == 0x77 && buf[start + 9] == 0x0D) {
-            //         uint8_t cksum = 0;
-            //         for (int i = 0; i < 8; ++i) cksum += buf[start + i];
-            //         if (cksum == buf[start + 8]) {
-            //             parse_encoder_ticks(&buf[start + 2]);
-            //             buf.clear();
-            //             continue;
-            //         }
-            //     }
-            // }
         }
     }
 
-    void parse_and_publish_imu(const uint8_t* data) {
-        // data[0..11] = ax_h ax_l ay_h ay_l az_h az_l gx_h gx_l gy_h gy_l gz_h gz_l
-        auto to_int16 = [](uint8_t h, uint8_t l) -> int16_t {
+    void parse_and_publish_imu(const uint8_t* d) {
+        auto i16 = [](uint8_t h, uint8_t l) -> int16_t {
             return static_cast<int16_t>((h << 8) | l);
         };
+        int16_t ax = i16(d[0],d[1]), ay = i16(d[2],d[3]), az = i16(d[4],d[5]);
+        int16_t gx = i16(d[6],d[7]), gy = i16(d[8],d[9]), gz = i16(d[10],d[11]);
 
-        int16_t ax_raw = to_int16(data[0],  data[1]);
-        int16_t ay_raw = to_int16(data[2],  data[3]);
-        int16_t az_raw = to_int16(data[4],  data[5]);
-        int16_t gx_raw = to_int16(data[6],  data[7]);
-        int16_t gy_raw = to_int16(data[8],  data[9]);
-        int16_t gz_raw = to_int16(data[10], data[11]);
+        double gxd = gx * GYRO_SCALE, gyd = gy * GYRO_SCALE, gzd = gz * GYRO_SCALE;
 
-        auto imu_msg = sensor_msgs::msg::Imu();
-        imu_msg.header.stamp    = this->now();
-        imu_msg.header.frame_id = "imu_link";
+        // Gyro bias calibration (first ~3s while stationary)
+        if (!calib_done_.load()) {
+            gyro_sum_x_ += gxd; gyro_sum_y_ += gyd; gyro_sum_z_ += gzd;
+            if (++calib_count_ >= CALIB_SAMPLES) {
+                gyro_bias_x_ = gyro_sum_x_ / CALIB_SAMPLES;
+                gyro_bias_y_ = gyro_sum_y_ / CALIB_SAMPLES;
+                gyro_bias_z_ = gyro_sum_z_ / CALIB_SAMPLES;
+                calib_done_.store(true);
+                RCLCPP_INFO(get_logger(), "Gyro calibrated: bz=%.5f rad/s", gyro_bias_z_);
+            }
+            return; // don't publish until calibrated
+        }
 
-        imu_msg.linear_acceleration.x = ax_raw * ACCEL_SCALE;
-        imu_msg.linear_acceleration.y = ay_raw * ACCEL_SCALE;
-        imu_msg.linear_acceleration.z = az_raw * ACCEL_SCALE;
+        gxd -= gyro_bias_x_; gyd -= gyro_bias_y_; gzd -= gyro_bias_z_;
+        if (std::abs(gxd) < 0.01) gxd = 0.0;
+        if (std::abs(gyd) < 0.01) gyd = 0.0;
+        if (std::abs(gzd) < 0.01) gzd = 0.0;
 
-        imu_msg.angular_velocity.x = gx_raw * GYRO_SCALE;
-        imu_msg.angular_velocity.y = gy_raw * GYRO_SCALE;
-        imu_msg.angular_velocity.z = gz_raw * GYRO_SCALE;
-
-        // Orientation not provided by MPU6050 raw data — mark unknown
-        imu_msg.orientation_covariance[0] = -1.0;
-
-        // Set covariance (diagonal) — approximate for MPU6050
-        imu_msg.linear_acceleration_covariance[0] = 0.04;
-        imu_msg.linear_acceleration_covariance[4] = 0.04;
-        imu_msg.linear_acceleration_covariance[8] = 0.04;
-
-        imu_msg.angular_velocity_covariance[0] = 0.02;
-        imu_msg.angular_velocity_covariance[4] = 0.02;
-        imu_msg.angular_velocity_covariance[8] = 0.02;
-
-        imu_pub_->publish(imu_msg);
+        auto msg = sensor_msgs::msg::Imu();
+        msg.header.stamp = this->now();
+        msg.header.frame_id = "imu_link";
+        msg.linear_acceleration.x = ax * ACCEL_SCALE;
+        msg.linear_acceleration.y = ay * ACCEL_SCALE;
+        msg.linear_acceleration.z = az * ACCEL_SCALE;
+        msg.angular_velocity.x = gxd;
+        msg.angular_velocity.y = gyd;
+        msg.angular_velocity.z = gzd;
+        msg.orientation_covariance[0] = -1.0;
+        msg.linear_acceleration_covariance[0] = 0.04;
+        msg.linear_acceleration_covariance[4] = 0.04;
+        msg.linear_acceleration_covariance[8] = 0.04;
+        msg.angular_velocity_covariance[0] = 0.02;
+        msg.angular_velocity_covariance[4] = 0.02;
+        msg.angular_velocity_covariance[8] = 0.02;
+        imu_pub_->publish(msg);
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // Helpers
-    // ═════════════════════════════════════════════════════════════════════════
-
     int8_t velocity_to_pwm(double wheel_rad_s) {
-        // Clamp to max
-        double ratio = wheel_rad_s / max_wheel_vel_;
-        ratio = std::clamp(ratio, -1.0, 1.0);
+        double ratio = std::clamp(wheel_rad_s / max_wheel_vel_, -1.0, 1.0);
         return static_cast<int8_t>(ratio * 127.0);
     }
 
+    // 8-byte packet matching flashed Arduino firmware:
+    // [0xAA][0x55][left][right][yaw_h][yaw_l][checksum][0x0D]
+    // checksum = sum of bytes 0-5
     void send_motor_packet(int8_t left, int8_t right) {
-        uint8_t packet[6];
-        packet[0] = 0xAA;                        // Header
-        packet[1] = 0x55;                        // Header
-        packet[2] = static_cast<uint8_t>(left);  // Left speed (signed, reinterpreted)
-        packet[3] = static_cast<uint8_t>(right); // Right speed
-        packet[4] = (packet[0] + packet[1] + packet[2] + packet[3]) & 0xFF; // Checksum
-        packet[5] = 0x0D;                        // Tail
-
+        uint8_t packet[8];
+        packet[0] = 0xAA;
+        packet[1] = 0x55;
+        packet[2] = static_cast<uint8_t>(-right);  // swap + negate: camera side is forward
+        packet[3] = static_cast<uint8_t>(-left);
+        packet[4] = 0x00;  // yaw_h (unused for now)
+        packet[5] = 0x00;  // yaw_l
+        packet[6] = static_cast<uint8_t>(packet[0] + packet[1] + packet[2] + packet[3] + packet[4] + packet[5]);
+        packet[7] = 0x0D;
         std::lock_guard<std::mutex> lock(serial_write_mutex_);
-        ::write(serial_fd_, packet, 6);
+        ::write(serial_fd_, packet, 8);
     }
 
     static int open_serial(const std::string& port, int baud) {
         int fd = open(port.c_str(), O_RDWR | O_NOCTTY | O_SYNC);
         if (fd < 0) return -1;
-
         struct termios tty{};
         if (tcgetattr(fd, &tty) != 0) { close(fd); return -1; }
-
         speed_t speed;
         switch (baud) {
             case 9600:   speed = B9600;   break;
-            case 19200:  speed = B19200;  break;
-            case 38400:  speed = B38400;  break;
             case 57600:  speed = B57600;  break;
             case 115200: speed = B115200; break;
             case 230400: speed = B230400; break;
-            case 460800: speed = B460800; break;
             default:     speed = B115200; break;
         }
         cfsetospeed(&tty, speed);
         cfsetispeed(&tty, speed);
-
         tty.c_cflag |= (CLOCAL | CREAD);
-        tty.c_cflag &= ~CSIZE;
-        tty.c_cflag |= CS8;
-        tty.c_cflag &= ~PARENB;
-        tty.c_cflag &= ~CSTOPB;
-        tty.c_cflag &= ~CRTSCTS;
-
-        // Raw mode
+        tty.c_cflag &= ~CSIZE; tty.c_cflag |= CS8;
+        tty.c_cflag &= ~PARENB; tty.c_cflag &= ~CSTOPB; tty.c_cflag &= ~CRTSCTS;
         tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
         tty.c_iflag &= ~(IXON | IXOFF | IXANY | IGNBRK | BRKINT | PARMRK |
                           ISTRIP | INLCR | IGNCR | ICRNL);
         tty.c_oflag &= ~OPOST;
-
-        tty.c_cc[VMIN]  = 0;
-        tty.c_cc[VTIME] = 1; // 100ms read timeout
-
+        tty.c_cc[VMIN] = 0; tty.c_cc[VTIME] = 1;
         if (tcsetattr(fd, TCSANOW, &tty) != 0) { close(fd); return -1; }
         tcflush(fd, TCIOFLUSH);
-
         return fd;
     }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<DiffDriveController>();
-    rclcpp::spin(node);
+    rclcpp::spin(std::make_shared<DiffDriveController>());
     rclcpp::shutdown();
     return 0;
 }

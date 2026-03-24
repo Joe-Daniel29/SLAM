@@ -5,8 +5,9 @@ Launches:
   1. robot_state_publisher     (URDF → static TF tree)
   2. custom_lidar_node         (LiDAR → /scan)
   3. diff_drive_controller     (cmd_vel → motors, IMU → /imu/data_raw, /odom/cmd_vel)
-  4. robot_localization EKF    (fuses IMU + cmd_vel → /odom + odom→base_link TF)
-  5. slam_toolbox              (lifecycle node, auto-activated → /map)
+  4. rf2o_laser_odometry       (scan-matching → /odom/rf2o)
+  5. robot_localization EKF    (fuses rf2o + IMU + cmd_vel → /odom + odom→base_link TF)
+  6. slam_toolbox              (lifecycle node, auto-activated → /map)
 
 Usage:
   ros2 launch slam_bot slam_bot.launch.py
@@ -16,13 +17,10 @@ Optional overrides:
 """
 
 import os
-import lifecycle_msgs.msg
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, EmitEvent, RegisterEventHandler
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node, LifecycleNode
-from launch_ros.events.lifecycle import ChangeState
-from launch_ros.event_handlers import OnStateTransition
 from ament_index_python.packages import get_package_share_directory
 
 
@@ -36,7 +34,7 @@ def generate_launch_description():
 
     # ── Launch arguments ──────────────────────────────────────────────────────
     serial_port_arg = DeclareLaunchArgument(
-        'serial_port', default_value='/dev/ttyACM0',
+        'serial_port', default_value='/dev/ttyAMA0',
         description='Serial port for Arduino motor/IMU bridge'
     )
 
@@ -77,7 +75,24 @@ def generate_launch_description():
         output='screen',
     )
 
-    # 4. Robot Localization EKF
+    # 4. rf2o Laser Odometry (scan-matching → /odom/rf2o for EKF)
+    rf2o_node = Node(
+        package='rf2o_laser_odometry',
+        executable='rf2o_laser_odometry_node',
+        name='rf2o_laser_odometry',
+        parameters=[{
+            'laser_scan_topic': '/scan',
+            'odom_topic': '/odom/rf2o',
+            'publish_tf': False,           # EKF owns the TF, not rf2o
+            'base_frame_id': 'base_link',
+            'odom_frame_id': 'odom',
+            'init_pose_from_topic': '',    # Empty = start from origin, don't wait for ground truth
+            'freq': 10.0,                 # Match LiDAR ~7.5 Hz, slight oversample
+        }],
+        output='screen',
+    )
+
+    # 5. Robot Localization EKF
     ekf_filter_node = Node(
         package='robot_localization',
         executable='ekf_node',
@@ -91,7 +106,7 @@ def generate_launch_description():
         output='screen',
     )
 
-    # 5. SLAM Toolbox (lifecycle node — auto-configured and auto-activated)
+    # 6. SLAM Toolbox (lifecycle node — must be configured + activated)
     slam_toolbox = LifecycleNode(
         package='slam_toolbox',
         executable='async_slam_toolbox_node',
@@ -103,30 +118,26 @@ def generate_launch_description():
         output='screen',
     )
 
-    # ── Auto-activate slam_toolbox lifecycle node ─────────────────────────────
-    # Step 1: Send CONFIGURE transition on launch
-    configure_slam = EmitEvent(
-        event=ChangeState(
-            lifecycle_node_matcher=lambda node: node.node_name == 'slam_toolbox',
-            transition_id=lifecycle_msgs.msg.Transition.TRANSITION_CONFIGURE,
-        )
-    )
-
-    # Step 2: When CONFIGURE succeeds (inactive state reached) → send ACTIVATE
-    activate_slam = RegisterEventHandler(
-        OnStateTransition(
-            target_lifecycle_node=slam_toolbox,
-            start_state='configuring',
-            goal_state='inactive',
-            entities=[
-                EmitEvent(
-                    event=ChangeState(
-                        lifecycle_node_matcher=lambda node: node.node_name == 'slam_toolbox',
-                        transition_id=lifecycle_msgs.msg.Transition.TRANSITION_ACTIVATE,
-                    )
-                )
-            ],
-        )
+    # Auto-activate slam_toolbox — retry loop until the node is available
+    activate_slam = TimerAction(
+        period=5.0,
+        actions=[
+            ExecuteProcess(
+                cmd=['bash', '-c',
+                     'source /opt/ros/jazzy/setup.bash && '
+                     'source ~/ros2_ws/install/setup.bash && '
+                     'echo "Waiting for slam_toolbox lifecycle node..." && '
+                     'for i in $(seq 1 30); do '
+                     '  ros2 lifecycle set /slam_toolbox configure 2>/dev/null && break; '
+                     '  echo "  Attempt $i: slam_toolbox not ready, retrying in 2s..."; '
+                     '  sleep 2; '
+                     'done && '
+                     'sleep 2 && '
+                     'ros2 lifecycle set /slam_toolbox activate && '
+                     'echo "slam_toolbox ACTIVE — /map should be publishing"'],
+                output='screen',
+            )
+        ],
     )
 
     return LaunchDescription([
@@ -134,8 +145,8 @@ def generate_launch_description():
         robot_state_publisher,
         custom_lidar_node,
         diff_drive_controller,
+        rf2o_node,
         ekf_filter_node,
         slam_toolbox,
-        configure_slam,
         activate_slam,
     ])

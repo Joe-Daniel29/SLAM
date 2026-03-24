@@ -1,0 +1,230 @@
+{
+  "main": {
+    "id": "a8610dd10b554474",
+    "type": "split",
+    "children": [
+      {
+        "id": "fdcfe9a42637ed4d",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "5f429dc6b9ddfa76",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "encoders for SLAM.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "encoders for SLAM"
+            }
+          },
+          {
+            "id": "54703c30c28178d5",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "encoder slip tackling.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "encoder slip tackling"
+            }
+          },
+          {
+            "id": "d2e8fbe78fd6dea9",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "pid_control.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "pid_control"
+            }
+          }
+        ],
+        "currentTab": 2
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "1691d4fae292697e",
+    "type": "split",
+    "children": [
+      {
+        "id": "75c42f67a0337f30",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "4066fc70d0aff21e",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "13703f0c3213c4e6",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "3afa442efda308bf",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "8c4f147b66dae32f",
+    "type": "split",
+    "children": [
+      {
+        "id": "9922c43910ef8739",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "a815ae96e9913780",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "pid_control.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks for pid_control"
+            }
+          },
+          {
+            "id": "c44fbb06e29a2ece",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "pid_control.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links from pid_control"
+            }
+          },
+          {
+            "id": "c9ebf88c4bb4c68a",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "ed5ce185fae17a6d",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "d8cb8712108fb904",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "pid_control.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline of pid_control"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "d2e8fbe78fd6dea9",
+  "lastOpenFiles": [
+    "mpu6050.md",
+    "serial_protocol.md",
+    "gyro_calibration.md",
+    "pid_control.md",
+    "motor_drift_debugging.md",
+    "build ai glasses.md",
+    "encoder slip tackling.md",
+    "encoders for SLAM.md",
+    "tf_frames.md",
+    "slam_overview.md",
+    "differential_drive_kinematics.md",
+    "ekf.md"
+  ]
+}

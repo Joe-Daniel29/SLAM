@@ -1,14 +1,20 @@
 /*
  * motors.ino — Differential Drive Motor Controller + MPU6050 IMU
  *
- * Receives 6-byte motor command packets from Raspberry Pi via UART:
- *   [0xAA] [0x55] [left_i8] [right_i8] [checksum] [0x0D]
+ * Protocol (Pi → Arduino) — 8-byte motor packet:
+ *   [0xAA][0x55][left_i8][right_i8][yaw_h][yaw_l][checksum][0x0D]
+ *   checksum = (byte0 + byte1 + byte2 + byte3 + byte4 + byte5) & 0xFF
+ *   yaw_h/yaw_l: reserved (currently unused, sent as 0x00)
  *
- * Sends 16-byte IMU data packets upstream at ~50 Hz:
- *   [0xBB] [0x66] [ax_h] [ax_l] [ay_h] [ay_l] [az_h] [az_l]
- *   [gx_h] [gx_l] [gy_h] [gy_l] [gz_h] [gz_l] [checksum] [0x0D]
+ * Protocol (Arduino → Pi) — 16-byte IMU packet:
+ *   [0xBB][0x66][ax_h][ax_l][ay_h][ay_l][az_h][az_l]
+ *   [gx_h][gx_l][gy_h][gy_l][gz_h][gz_l][checksum][0x0D]
+ *   checksum = sum of bytes 0-13
  *
- * [FUTURE] Encoder packet (0xCC 0x77) — reserved, see bottom of file.
+ * Motor features:
+ *   - Dead-band compensation (remaps to PWM_MIN..255 so motors always move)
+ *   - Kick-start pulse (overcomes stiction from standstill)
+ *   - EMA smoothing on PWM output (prevents jerky jumps)
  *
  * Hardware:
  *   - BTS7960 dual H-bridge (4 PWM pins)
@@ -21,7 +27,7 @@
 #include <Wire.h>
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Pin Definitions — swap FORWARD/BACKWARD to reverse a motor's direction
+// Pin Definitions
 // ═══════════════════════════════════════════════════════════════════════════════
 #define LEFT_FORWARD_PIN   9
 #define LEFT_BACKWARD_PIN  10
@@ -29,15 +35,25 @@
 #define RIGHT_BACKWARD_PIN 6
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// MPU6050 I2C Address
+// MPU6050
 // ═══════════════════════════════════════════════════════════════════════════════
 #define MPU6050_ADDR 0x68
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Motor tuning — calibrate per-motor on your robot
+// Put the robot on the ground, slowly increase PWM_MIN until wheels just move.
+// ═══════════════════════════════════════════════════════════════════════════════
+#define PWM_MIN_LEFT     45   // minimum PWM where left motor turns under load
+#define PWM_MIN_RIGHT    45   // minimum PWM where right motor turns under load
+#define KICK_PWM_EXTRA   35   // extra PWM for kick-start pulse
+#define KICK_DURATION_MS 20   // ms — kick-start duration
+#define SMOOTH_ALPHA     0.4  // EMA alpha (0.1 = very smooth, 1.0 = instant)
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Timing
 // ═══════════════════════════════════════════════════════════════════════════════
-#define MOTOR_WATCHDOG_MS   500   // Stop motors if no command for this long
-#define IMU_SEND_INTERVAL   20    // ms (~50 Hz)
+#define MOTOR_WATCHDOG_MS  500  // stop motors if no command for this long
+#define IMU_SEND_INTERVAL  20   // ms (~50 Hz)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // State
@@ -46,14 +62,34 @@ unsigned long lastMotorCmdTime = 0;
 unsigned long lastImuSendTime  = 0;
 bool motorsActive = false;
 
-// Serial receive buffer
-uint8_t rxBuf[6];
+// Serial parser
+uint8_t rxBuf[8];
 uint8_t rxIdx = 0;
 
+// Smoothed PWM (EMA state)
+float smoothLeftPWM  = 0.0;
+float smoothRightPWM = 0.0;
+
+// Kick-start detection
+bool leftWasStopped  = true;
+bool rightWasStopped = true;
+
 // ═══════════════════════════════════════════════════════════════════════════════
-// Motor Control — safe BTS7960 drive (never PWM both directions at once)
+// Dead-band compensation
+// Maps raw 0-255 → PWM_MIN-255 so any non-zero command actually moves the motor
 // ═══════════════════════════════════════════════════════════════════════════════
-void setMotor(int fwdPin, int bwdPin, int speed) {
+int compensateDeadband(int raw_pwm, int pwm_min) {
+  if (raw_pwm == 0) return 0;
+  int sign = (raw_pwm > 0) ? 1 : -1;
+  int a = abs(raw_pwm);
+  int output = pwm_min + (int)((float)a / 255.0 * (255 - pwm_min));
+  return output * sign;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Motor drive — safe BTS7960 (never PWM both directions at once)
+// ═══════════════════════════════════════════════════════════════════════════════
+void setMotorRaw(int fwdPin, int bwdPin, int speed) {
   speed = constrain(speed, -255, 255);
   if (speed > 0) {
     analogWrite(fwdPin, speed);
@@ -67,10 +103,21 @@ void setMotor(int fwdPin, int bwdPin, int speed) {
   }
 }
 
+void kickStart(int fwdPin, int bwdPin, int target_pwm) {
+  int kick = min(abs(target_pwm) + KICK_PWM_EXTRA, 255);
+  int sign = (target_pwm > 0) ? 1 : -1;
+  setMotorRaw(fwdPin, bwdPin, kick * sign);
+  delay(KICK_DURATION_MS);
+}
+
 void stopMotors() {
-  setMotor(LEFT_FORWARD_PIN,  LEFT_BACKWARD_PIN,  0);
-  setMotor(RIGHT_FORWARD_PIN, RIGHT_BACKWARD_PIN, 0);
-  motorsActive = false;
+  setMotorRaw(LEFT_FORWARD_PIN,  LEFT_BACKWARD_PIN,  0);
+  setMotorRaw(RIGHT_FORWARD_PIN, RIGHT_BACKWARD_PIN, 0);
+  motorsActive    = false;
+  smoothLeftPWM   = 0.0;
+  smoothRightPWM  = 0.0;
+  leftWasStopped  = true;
+  rightWasStopped = true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -78,104 +125,101 @@ void stopMotors() {
 // ═══════════════════════════════════════════════════════════════════════════════
 void setupMPU6050() {
   Wire.begin();
-  Wire.setClock(400000); // 400 kHz fast I2C
+  Wire.setClock(400000);
 
-  // Wake up MPU6050 (exit sleep mode)
   Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x6B); // PWR_MGMT_1
-  Wire.write(0x00); // Clear sleep bit
+  Wire.write(0x6B); Wire.write(0x00); // wake
   Wire.endTransmission(true);
 
-  // Configure accelerometer: ±2g (default, sensitivity = 16384 LSB/g)
   Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x1C); // ACCEL_CONFIG
-  Wire.write(0x00); // ±2g
+  Wire.write(0x1C); Wire.write(0x00); // accel ±2g
   Wire.endTransmission(true);
 
-  // Configure gyroscope: ±250°/s (default, sensitivity = 131 LSB/°/s)
   Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x1B); // GYRO_CONFIG
-  Wire.write(0x00); // ±250°/s
+  Wire.write(0x1B); Wire.write(0x00); // gyro ±250°/s
   Wire.endTransmission(true);
 
-  // Set DLPF (Digital Low Pass Filter) to ~44 Hz bandwidth
   Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x1A); // CONFIG
-  Wire.write(0x03); // DLPF_CFG = 3 (44 Hz accel, 42 Hz gyro)
+  Wire.write(0x1A); Wire.write(0x03); // DLPF ~44Hz
   Wire.endTransmission(true);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Read 14 bytes of raw sensor data from MPU6050 and send as packet
+// Read IMU + send 16-byte packet to Pi
 // ═══════════════════════════════════════════════════════════════════════════════
 void readAndSendIMU() {
   Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x3B); // Start at ACCEL_XOUT_H
+  Wire.write(0x3B);
   Wire.endTransmission(false);
   Wire.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)14, (uint8_t)true);
 
-  if (Wire.available() < 14) return; // Incomplete read, skip
+  if (Wire.available() < 14) return;
 
   uint8_t packet[16];
-  packet[0] = 0xBB; // Header
-  packet[1] = 0x66; // Header
+  packet[0] = 0xBB;
+  packet[1] = 0x66;
 
-  // Accel X, Y, Z (6 bytes) — registers 0x3B–0x40
-  packet[2] = Wire.read();  // ax_h
-  packet[3] = Wire.read();  // ax_l
-  packet[4] = Wire.read();  // ay_h
-  packet[5] = Wire.read();  // ay_l
-  packet[6] = Wire.read();  // az_h
-  packet[7] = Wire.read();  // az_l
+  // Accel X, Y, Z (6 bytes)
+  for (int i = 2; i < 8; i++) packet[i] = Wire.read();
 
-  // Skip temperature (2 bytes) — registers 0x41–0x42
-  Wire.read();
-  Wire.read();
+  // Skip temperature (2 bytes)
+  Wire.read(); Wire.read();
 
-  // Gyro X, Y, Z (6 bytes) — registers 0x43–0x48
-  packet[8]  = Wire.read(); // gx_h
-  packet[9]  = Wire.read(); // gx_l
-  packet[10] = Wire.read(); // gy_h
-  packet[11] = Wire.read(); // gy_l
-  packet[12] = Wire.read(); // gz_h
-  packet[13] = Wire.read(); // gz_l
+  // Gyro X, Y, Z (6 bytes)
+  for (int i = 8; i < 14; i++) packet[i] = Wire.read();
 
-  // Checksum: sum of bytes 0–13
+  // Checksum over bytes 0-13
   uint8_t cksum = 0;
-  for (int i = 0; i < 14; i++) {
-    cksum += packet[i];
-  }
+  for (int i = 0; i < 14; i++) cksum += packet[i];
   packet[14] = cksum;
-  packet[15] = 0x0D; // Tail
+  packet[15] = 0x0D;
 
   Serial.write(packet, 16);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Parse incoming motor command packet
+// Process 8-byte motor packet from Pi
+// [0xAA][0x55][left][right][yaw_h][yaw_l][checksum][0x0D]
 // ═══════════════════════════════════════════════════════════════════════════════
 void processMotorPacket(uint8_t* pkt) {
-  // Validate header and tail
-  if (pkt[0] != 0xAA || pkt[1] != 0x55 || pkt[5] != 0x0D) return;
+  // Validate header + tail
+  if (pkt[0] != 0xAA || pkt[1] != 0x55 || pkt[7] != 0x0D) return;
 
-  // Validate checksum
-  uint8_t expected_cksum = (pkt[0] + pkt[1] + pkt[2] + pkt[3]) & 0xFF;
-  if (pkt[4] != expected_cksum) return;
+  // Validate checksum (sum of bytes 0-5)
+  uint8_t cksum = 0;
+  for (int i = 0; i < 6; i++) cksum += pkt[i];
+  if (cksum != pkt[6]) return;
 
-  // Extract signed speeds (-127 to +127)
+  // Extract signed motor commands (-127 to +127)
   int8_t leftCmd  = (int8_t)pkt[2];
   int8_t rightCmd = (int8_t)pkt[3];
+  // pkt[4], pkt[5] = yaw millirad/s (reserved, not used yet)
 
-  // Scale from [-127, +127] to [-255, +255] PWM
-  int leftPWM  = map(leftCmd,  -127, 127, -255, 255);
-  int rightPWM = map(rightCmd, -127, 127, -255, 255);
+  // Scale [-127, +127] → [-255, +255]
+  int leftRaw  = map(leftCmd,  -127, 127, -255, 255);
+  int rightRaw = map(rightCmd, -127, 127, -255, 255);
 
-  // Apply deadband (ignore tiny commands that cause motor whine)
-  if (abs(leftPWM)  < 15) leftPWM  = 0;
-  if (abs(rightPWM) < 15) rightPWM = 0;
+  // Dead-band compensation
+  int leftComp  = compensateDeadband(leftRaw,  PWM_MIN_LEFT);
+  int rightComp = compensateDeadband(rightRaw, PWM_MIN_RIGHT);
 
-  setMotor(LEFT_FORWARD_PIN,  LEFT_BACKWARD_PIN,  leftPWM);
-  setMotor(RIGHT_FORWARD_PIN, RIGHT_BACKWARD_PIN, rightPWM);
+  // EMA smoothing
+  smoothLeftPWM  = smoothLeftPWM  * (1.0 - SMOOTH_ALPHA) + leftComp  * SMOOTH_ALPHA;
+  smoothRightPWM = smoothRightPWM * (1.0 - SMOOTH_ALPHA) + rightComp * SMOOTH_ALPHA;
+
+  int leftPWM  = (int)smoothLeftPWM;
+  int rightPWM = (int)smoothRightPWM;
+
+  // Final deadband (avoid motor whine at very low PWM)
+  if (abs(leftPWM)  < PWM_MIN_LEFT  / 2) leftPWM  = 0;
+  if (abs(rightPWM) < PWM_MIN_RIGHT / 2) rightPWM = 0;
+
+  // Drive motors (no kick-start — the EMA ramp + deadband compensation handles it)
+  setMotorRaw(LEFT_FORWARD_PIN,  LEFT_BACKWARD_PIN,  leftPWM);
+  setMotorRaw(RIGHT_FORWARD_PIN, RIGHT_BACKWARD_PIN, rightPWM);
+
+  leftWasStopped  = (leftPWM  == 0);
+  rightWasStopped = (rightPWM == 0);
 
   motorsActive = true;
   lastMotorCmdTime = millis();
@@ -187,14 +231,12 @@ void processMotorPacket(uint8_t* pkt) {
 void setup() {
   Serial.begin(115200);
 
-  // Motor pins
   pinMode(LEFT_FORWARD_PIN,   OUTPUT);
   pinMode(LEFT_BACKWARD_PIN,  OUTPUT);
   pinMode(RIGHT_FORWARD_PIN,  OUTPUT);
   pinMode(RIGHT_BACKWARD_PIN, OUTPUT);
   stopMotors();
 
-  // MPU6050
   setupMPU6050();
 
   lastMotorCmdTime = millis();
@@ -207,38 +249,29 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // ── 1. Read serial for motor commands ──────────────────────────────────────
+  // 1. Parse incoming 8-byte motor packets
   while (Serial.available() > 0) {
     uint8_t b = Serial.read();
 
-    // Synchronize: if we see header byte 0xAA at position 0, start buffering
-    if (rxIdx == 0 && b != 0xAA) continue; // Wait for header
-    if (rxIdx == 1 && b != 0x55) { rxIdx = 0; continue; } // Bad second header
+    if (rxIdx == 0 && b != 0xAA) continue;       // wait for header byte 1
+    if (rxIdx == 1 && b != 0x55) { rxIdx = 0; continue; } // header byte 2
 
     rxBuf[rxIdx++] = b;
 
-    if (rxIdx >= 6) {
+    if (rxIdx >= 8) {
       processMotorPacket(rxBuf);
       rxIdx = 0;
     }
   }
 
-  // ── 2. Motor watchdog ──────────────────────────────────────────────────────
+  // 2. Motor watchdog — stop if no command received
   if (motorsActive && (now - lastMotorCmdTime > MOTOR_WATCHDOG_MS)) {
     stopMotors();
   }
 
-  // ── 3. Send IMU data at ~50 Hz ────────────────────────────────────────────
+  // 3. Send IMU data at ~50 Hz
   if (now - lastImuSendTime >= IMU_SEND_INTERVAL) {
     readAndSendIMU();
     lastImuSendTime = now;
   }
-
-  // ── 4. [FUTURE] Read encoders and send encoder packet ─────────────────────
-  // When you add quadrature encoders:
-  //   - Attach interrupt pins for encoder A/B channels
-  //   - Count ticks in ISR
-  //   - At ~50 Hz, send packet: [0xCC] [0x77] [leftTicks_4bytes] [rightTicks_4bytes] [cksum] [0x0D]
-  //   - Reset tick counters after sending
-  // The diff_drive_controller on the Pi already has a stub to parse 0xCC 0x77 packets.
 }

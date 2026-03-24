@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ssh:*)",
+      "Bash(scp \"C:/Users/joe29/Documents/RoboticsCore/SLAM/src/frontier_explorer.cpp\" joe@192.168.11.185:~/ros2_ws/src/slam_bot/src/)"
+    ]
+  }
+}
